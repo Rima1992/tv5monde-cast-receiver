@@ -1,111 +1,109 @@
 /**
- * TV5Monde Plus – Bitmovin CAF Custom Receiver
+ * TV5Monde Plus – CAF v3 Custom Receiver
  *
- * Objectif : injecter le token Nagra (nv-authorizations) dans chaque requête
- * de licence Widevine pour les contenus live DRM TV5Monde.
+ * Receiver CAF v3 pur (Shaka Player natif — pas de SDK Bitmovin côté receiver).
+ * Le CAF v3 intègre Shaka Player comme player par défaut et ne supporte pas
+ * de player tiers. On utilise donc les APIs CAF v3 standard pour injecter
+ * le token Nagra dans les requêtes de licence Widevine.
  *
- * Flux :
- *  1. L'app Android crée le Player avec customReceiverConfig = { "nv-authorizations": token }
- *  2. Ce receiver lit le token dans customData à la connexion (LOAD request)
- *  3. Le token est aussi mis à jour via sendMessage() si la session Cast démarre
- *     après le chargement de la source (namespace urn:x-cast:com.bitmovin.player.caf)
- *  4. Le token est injecté dans playbackConfig.licenseRequestHandler pour
- *     toutes les requêtes vers le serveur de licence Nagra Widevine
- *
- * Déploiement :
- *  - Héberger index.html + receiver.js sur HTTPS (ex: GitHub Pages, Firebase Hosting)
- *  - Enregistrer l'URL sur https://cast.google.com/publish/#/signup
- *  - Mettre l'App ID résultant dans android/fuzyo-player-sdk/src/main/res/values/strings.xml
- *    comme valeur de app_id
+ * Flux du token Nagra :
+ *  1. Android → customReceiverConfig { "nv-authorizations": token }
+ *     → transmis dans loadRequestData.customData au moment du LOAD
+ *  2. Android → sendMessage({ type: "nagra-drm-token", "nv-authorizations": token })
+ *     → reçu via addCustomMessageListener (namespace urn:x-cast:com.bitmovin.player.caf)
+ *  3. Le token est injecté via licenseRequestHandler dans chaque requête Widevine
  */
 
 'use strict';
 
-// ── 1. Contexte CAF ────────────────────────────────────────────────────────────
+// ── 1. Contexte CAF v3 ────────────────────────────────────────────────────────
 const context = cast.framework.CastReceiverContext.getInstance();
 const playerManager = context.getPlayerManager();
 
-// ── 2. Initialisation du receiver Bitmovin ────────────────────────────────────
-const bitmovinReceiver = new bitmovin.receiver.BitmovinReceiver(context);
-
-// ── 3. Stockage du token Nagra (mis à jour depuis customData ou sendMessage) ──
+// ── 2. Stockage du token Nagra ────────────────────────────────────────────────
 let nagraToken = null;
 
 /**
- * Injecte le token Nagra dans la configuration DRM d'une requête de licence.
- * Appelé dans licenseRequestHandler pour chaque requête Widevine.
- *
- * @param {Object} requestObject – objet requête CAF (modifiable in-place)
+ * Injecte le token Nagra dans les headers de la requête de licence Widevine.
  */
-function injectNagraToken(requestObject) {
-  if (!nagraToken) return;
-
-  // Injection dans les headers HTTP de la requête de licence Widevine
-  if (!requestObject.headers) {
-    requestObject.headers = {};
+function injectNagraToken(requestInfo) {
+  if (!nagraToken) {
+    console.log('[TV5Receiver] Pas de token Nagra disponible');
+    return;
   }
-  requestObject.headers['nv-authorizations'] = nagraToken;
-  requestObject.headers['Accept']            = 'application/octet-stream';
-  requestObject.headers['Content-Type']      = 'application/octet-stream';
-
-  console.log('[TV5Receiver] Token Nagra injecté dans la requête de licence');
+  if (!requestInfo.headers) {
+    requestInfo.headers = {};
+  }
+  requestInfo.headers['nv-authorizations'] = nagraToken;
+  requestInfo.headers['Accept']            = 'application/octet-stream';
+  requestInfo.headers['Content-Type']      = 'application/octet-stream';
+  console.log('[TV5Receiver] Token Nagra injecté (longueur=' + nagraToken.length + ')');
 }
 
-// ── 4. Intercepter les requêtes LOAD pour lire customData ────────────────────
+// ── 3. Intercepter le LOAD pour lire customData ───────────────────────────────
 /**
- * L'app Android passe le token Nagra via :
+ * Android passe le token via :
  *   RemoteControlConfig.customReceiverConfig = { "nv-authorizations": token }
- *
- * Bitmovin le transmet dans loadRequestData.customData (objet JSON) lors du LOAD.
+ * Bitmovin le place dans loadRequestData.customData.
  */
 playerManager.setMessageInterceptor(
   cast.framework.messages.MessageType.LOAD,
   (loadRequestData) => {
-    const customData = loadRequestData.customData;
+    console.log('[TV5Receiver] LOAD intercepté');
 
-    if (customData && customData['nv-authorizations']) {
-      nagraToken = customData['nv-authorizations'];
-      console.log('[TV5Receiver] Token Nagra lu depuis customData (longueur=' + nagraToken.length + ')');
+    // Lire le token depuis customData
+    const customData = loadRequestData.customData;
+    if (customData) {
+      if (customData['nv-authorizations']) {
+        nagraToken = customData['nv-authorizations'];
+        console.log('[TV5Receiver] Token Nagra lu depuis customData (longueur=' + nagraToken.length + ')');
+      }
+      // Bitmovin encapsule parfois dans un sous-objet "drm"
+      if (!nagraToken && customData.drm && customData.drm['nv-authorizations']) {
+        nagraToken = customData.drm['nv-authorizations'];
+        console.log('[TV5Receiver] Token Nagra lu depuis customData.drm');
+      }
+    }
+
+    if (!nagraToken) {
+      console.warn('[TV5Receiver] Aucun token Nagra dans customData — contenu non DRM ou token manquant');
     }
 
     return loadRequestData;
   }
 );
 
-// ── 5. Écouter les messages sendMessage() depuis l'app Android ───────────────
+// ── 4. Écouter les sendMessage() depuis Android ───────────────────────────────
 /**
- * L'app Android envoie le token via BitmovinCastManager.sendMessage() sur :
- *   namespace = urn:x-cast:com.bitmovin.player.caf
- *
- * Format attendu : JSON { "type": "nagra-drm-token", "nv-authorizations": "<token>" }
- *
- * Cela permet de rafraîchir le token si la session Cast démarre après
- * que la source soit déjà chargée côté Android.
+ * Android envoie le token via BitmovinCastManager.sendMessage() sur le namespace
+ * urn:x-cast:com.bitmovin.player.caf après CastStarted.
+ * Format : { "type": "nagra-drm-token", "nv-authorizations": "<token>" }
  */
 context.addCustomMessageListener(
   'urn:x-cast:com.bitmovin.player.caf',
   (event) => {
     try {
-      const message = JSON.parse(event.data);
-      console.log('[TV5Receiver] Message reçu via namespace Bitmovin: type=' + message.type);
+      const message = typeof event.data === 'string'
+        ? JSON.parse(event.data)
+        : event.data;
+
+      console.log('[TV5Receiver] Message reçu: type=' + message.type);
 
       if (message.type === 'nagra-drm-token' && message['nv-authorizations']) {
         nagraToken = message['nv-authorizations'];
         console.log('[TV5Receiver] Token Nagra mis à jour via sendMessage (longueur=' + nagraToken.length + ')');
       }
     } catch (e) {
-      console.warn('[TV5Receiver] Impossible de parser le message custom: ' + e.message);
+      console.warn('[TV5Receiver] Erreur parsing message: ' + e.message);
     }
   }
 );
 
-// ── 6. Configuration de la playback – injecter le token dans licenseRequestHandler ──
+// ── 5. Injecter le token dans les requêtes de licence Widevine ────────────────
 /**
- * playbackConfig.licenseRequestHandler est appelé par le SDK Bitmovin CAF
- * avant CHAQUE requête vers le serveur de licence Widevine.
- *
- * C'est ici que le token Nagra est injecté dans les headers HTTP.
- * Sans ce handler, le serveur Nagra répond 401 → lecture DRM bloquée.
+ * playbackConfig.licenseRequestHandler est appelé par Shaka Player (intégré au CAF v3)
+ * avant chaque requête vers le serveur de licence Widevine.
+ * C'est ici que le header nv-authorizations est ajouté.
  */
 const playbackConfig = new cast.framework.PlaybackConfig();
 
@@ -115,28 +113,10 @@ playbackConfig.licenseRequestHandler = (requestInfo) => {
 
 context.setPlaybackConfig(playbackConfig);
 
-// ── 7. Callback onCustomMessage du receiver Bitmovin ─────────────────────────
-/**
- * Le SDK Bitmovin CAF expose aussi onCustomMessage() pour les messages
- * transmis via sendMessage() depuis l'app Android.
- * On double la gestion ici pour être compatible avec les deux mécanismes.
- */
-bitmovinReceiver.onCustomMessage = (namespace, senderId, message) => {
-  try {
-    const parsed = JSON.parse(message);
-    if (parsed.type === 'nagra-drm-token' && parsed['nv-authorizations']) {
-      nagraToken = parsed['nv-authorizations'];
-      console.log('[TV5Receiver] onCustomMessage: token Nagra mis à jour (longueur=' + nagraToken.length + ')');
-    }
-  } catch (e) {
-    console.warn('[TV5Receiver] onCustomMessage: parse error → ' + e.message);
-  }
-};
-
-// ── 8. Démarrage du receiver ──────────────────────────────────────────────────
+// ── 6. Démarrage du receiver ──────────────────────────────────────────────────
 context.start({
   touchScreenOptimizedApp: false,
-  maxInactivity: 3600, // 1h – maintenir la session Cast active pour le live
+  maxInactivity: 3600,
 });
 
-console.log('[TV5Receiver] Receiver TV5Monde Plus démarré');
+console.log('[TV5Receiver] CAF v3 Receiver TV5Monde Plus démarré');
